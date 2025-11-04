@@ -363,29 +363,44 @@ async def lookup(ctx, *, name: str):
             match_indices = expand_merged_rows(df_to_search, match_indices, search_name_col_idx)
         
         if match_indices:
-            # Extract superstar names from raw data before formatting for grouping
-            for idx in match_indices:
-                if name_col_idx is not None and name_col_idx < len(df_original.iloc[idx]):
-                    wrestler_name_cell = str(df_original.iloc[idx, name_col_idx]).strip()
-                    if wrestler_name_cell and wrestler_name_cell.lower() != 'nan':
-                        # Use the wrestler name as the key (first non-empty name cell)
-                        if wrestler_name_cell not in all_superstar_data:
-                            all_superstar_data[wrestler_name_cell] = {}
-                        if sheet_name not in all_superstar_data[wrestler_name_cell]:
-                            all_superstar_data[wrestler_name_cell][sheet_name] = []
+            # Extract full superstar names from raw data (including variant/class) for grouping
+            for i in range(0, len(match_indices), 3):
+                moveset_group = match_indices[i:i+3]
+                if moveset_group:
+                    first_row = df_original.iloc[moveset_group[0]]
+                    # Build full name from first 3 columns (Wrestler | Era | Class)
+                    full_name_parts = []
+                    for j in range(min(3, len(first_row))):
+                        val = str(first_row.iloc[j]).strip()
+                        if val and val.lower() != 'nan':
+                            full_name_parts.append(val)
+                    full_superstar_name = " | ".join(full_name_parts) if full_name_parts else "Unknown"
+                    
+                    # Use full name as key for better identification
+                    if full_superstar_name not in all_superstar_data:
+                        all_superstar_data[full_superstar_name] = {}
+                    if sheet_name not in all_superstar_data[full_superstar_name]:
+                        all_superstar_data[full_superstar_name][sheet_name] = []
             
             movesets = format_moveset_group(df_to_display, match_indices, display_headers)
             if movesets:
-                # Group movesets by superstar name
+                # Group movesets by full superstar name
                 for moveset_idx, moveset in enumerate(movesets):
                     # Find which superstar this moveset belongs to
-                    for idx in match_indices[moveset_idx * 3:min((moveset_idx + 1) * 3, len(match_indices))]:
-                        if name_col_idx is not None and name_col_idx < len(df_original.iloc[idx]):
-                            wrestler_name = str(df_original.iloc[idx, name_col_idx]).strip()
-                            if wrestler_name and wrestler_name.lower() != 'nan':
-                                if wrestler_name in all_superstar_data and sheet_name in all_superstar_data[wrestler_name]:
-                                    all_superstar_data[wrestler_name][sheet_name].append(moveset)
-                                break
+                    moveset_group_start = moveset_idx * 3
+                    if moveset_group_start < len(match_indices):
+                        moveset_group = match_indices[moveset_group_start:min(moveset_group_start + 3, len(match_indices))]
+                        if moveset_group:
+                            first_row = df_original.iloc[moveset_group[0]]
+                            full_name_parts = []
+                            for j in range(min(3, len(first_row))):
+                                val = str(first_row.iloc[j]).strip()
+                                if val and val.lower() != 'nan':
+                                    full_name_parts.append(val)
+                            full_superstar_name = " | ".join(full_name_parts) if full_name_parts else "Unknown"
+                            
+                            if full_superstar_name in all_superstar_data and sheet_name in all_superstar_data[full_superstar_name]:
+                                all_superstar_data[full_superstar_name][sheet_name].append(moveset)
                 results_by_sheet[sheet_name] = movesets
 
     if not results_by_sheet and not tier_list_entries:
