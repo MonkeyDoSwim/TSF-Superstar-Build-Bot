@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands
 import pandas as pd
 import os
+import asyncio
 
 EXCEL_FILE = "Copy of Twilight BATs' WWE Champions Tier List.xlsx"
 COMMAND_PREFIX = "!"
@@ -287,6 +288,7 @@ async def lookup(ctx, *, name: str):
 
     results_by_sheet = {}
     tier_list_entries = []
+    all_superstar_data = {}  # Store data per superstar for selection
 
     for sheet_name, df in all_sheets.items():
         # Special handling for 'Tier List': only consider row 7 (index 6) and place in separate embed
@@ -361,8 +363,29 @@ async def lookup(ctx, *, name: str):
             match_indices = expand_merged_rows(df_to_search, match_indices, search_name_col_idx)
         
         if match_indices:
+            # Extract superstar names from raw data before formatting for grouping
+            for idx in match_indices:
+                if name_col_idx is not None and name_col_idx < len(df_original.iloc[idx]):
+                    wrestler_name_cell = str(df_original.iloc[idx, name_col_idx]).strip()
+                    if wrestler_name_cell and wrestler_name_cell.lower() != 'nan':
+                        # Use the wrestler name as the key (first non-empty name cell)
+                        if wrestler_name_cell not in all_superstar_data:
+                            all_superstar_data[wrestler_name_cell] = {}
+                        if sheet_name not in all_superstar_data[wrestler_name_cell]:
+                            all_superstar_data[wrestler_name_cell][sheet_name] = []
+            
             movesets = format_moveset_group(df_to_display, match_indices, display_headers)
             if movesets:
+                # Group movesets by superstar name
+                for moveset_idx, moveset in enumerate(movesets):
+                    # Find which superstar this moveset belongs to
+                    for idx in match_indices[moveset_idx * 3:min((moveset_idx + 1) * 3, len(match_indices))]:
+                        if name_col_idx is not None and name_col_idx < len(df_original.iloc[idx]):
+                            wrestler_name = str(df_original.iloc[idx, name_col_idx]).strip()
+                            if wrestler_name and wrestler_name.lower() != 'nan':
+                                if wrestler_name in all_superstar_data and sheet_name in all_superstar_data[wrestler_name]:
+                                    all_superstar_data[wrestler_name][sheet_name].append(moveset)
+                                break
                 results_by_sheet[sheet_name] = movesets
 
     if not results_by_sheet and not tier_list_entries:
@@ -373,6 +396,38 @@ async def lookup(ctx, *, name: str):
         )
         return
 
+    # Check if multiple distinct superstars found - show selection menu
+    if len(all_superstar_data) > 1:
+        number_emojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟']
+        superstar_list = list(all_superstar_data.keys())[:10]  # Max 10 options
+        
+        selection_text = "**Multiple superstars found!** Please react with the number to view:\n\n"
+        for idx, superstar in enumerate(superstar_list):
+            selection_text += f"{number_emojis[idx]} {superstar}\n"
+        
+        selection_msg = await ctx.send(selection_text)
+        
+        # Add reactions
+        for idx in range(len(superstar_list)):
+            await selection_msg.add_reaction(number_emojis[idx])
+        
+        # Wait for reaction from the command author
+        def check(reaction, user):
+            return user == ctx.author and str(reaction.emoji) in number_emojis[:len(superstar_list)] and reaction.message.id == selection_msg.id
+        
+        try:
+            reaction, user = await bot.wait_for('reaction_add', timeout=60.0, check=check)
+            selected_idx = number_emojis.index(str(reaction.emoji))
+            selected_superstar = superstar_list[selected_idx]
+            
+            # Filter results to only show selected superstar
+            results_by_sheet = all_superstar_data[selected_superstar].copy()
+            await selection_msg.delete()  # Remove selection message
+            
+        except asyncio.TimeoutError:
+            await ctx.send("⏱️ Selection timed out. Please run the command again.")
+            return
+    
     def split_long_text(text, max_length=1020):
         """Split text into chunks that fit within Discord field limits, trying to preserve line breaks."""
         if len(text) <= max_length:
