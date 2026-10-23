@@ -1,590 +1,498 @@
-import discord
-from discord.ext import commands
-import pandas as pd
-import os
+#!/usr/bin/env python3
+"""Champions Bot v2 - WWE Champions build lookup for Discord.
+
+Slash commands over a JSON index built from the Twilight BATs tier-list
+sheet (see build_index.py / DATA_NOTES.md). No spreadsheet is read at
+runtime except inside /refresh.
+
+    /build    superstar build (movesets paginated with buttons)
+    /plate    which builds run a given Skill/Ultimate Plate
+    /trainer  entourage Trainer card lookup
+    /coach    entourage Coach card lookup (also covers Promoters)
+    /tierlist tier rankings + Coming Soon
+    /refresh  (admin) re-download the sheet and rebuild the index
+
+Token comes from the DISCORD_BOT_TOKEN environment variable.
+Set DISCORD_GUILD_ID to sync commands to one guild instantly during dev;
+leave it unset for global commands.
+"""
+
+from __future__ import annotations
+
 import asyncio
+import json
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
 
-EXCEL_FILE = "Copy of Twilight BATs' WWE Champions Tier List.xlsx"
-COMMAND_PREFIX = "!"
-INTENTS = discord.Intents.default()
-INTENTS.message_content = True
+import discord
+from discord import app_commands
+from discord.ext import commands
 
-EXCLUDED_COLUMN_NAMES = ["Trainer 1", "Trainer 2", "Coach 1", "Coach 2"]
+import build_index
+import search as search_core
 
-print("📂 Loading Excel file...")
-if not os.path.exists(EXCEL_FILE):
-    print(f"❌ File not found: {EXCEL_FILE}")
-    exit()
+BASE_DIR = Path(__file__).resolve().parent
+INDEX_PATH = BASE_DIR / "data" / "index.json"
 
-xls = pd.ExcelFile(EXCEL_FILE)
-all_sheets = {}
-sheet_headers = {}
-for sheet_name in xls.sheet_names:
+CLASS_COLORS = {
+    "Strikers": 0x000000,
+    "Acrobats": 0x3498DB,
+    "Technicians": 0x2ECC71,
+    "Tricksters": 0x9B59B6,
+    "Powerhouses": 0xE74C3C,
+    "Showboats": 0xF1C40F,
+}
+DEFAULT_COLOR = 0x5865F2
+TIER_ORDER = ["S+ Tier", "S Tier", "A Tier", "B Tier", "Cheese", "Entourage"]
+MAX_FIELD = 1024
+
+# ---------------------------------------------------------------------------
+# Index loading (lazy + reloadable for /refresh)
+
+_INDEX_CACHE: dict = {"data": None}
+
+
+def get_index() -> dict:
+    if _INDEX_CACHE["data"] is None:
+        _INDEX_CACHE["data"] = search_core.load_index(INDEX_PATH)
+    return _INDEX_CACHE["data"]
+
+
+def set_index(data: dict) -> None:
+    _INDEX_CACHE["data"] = data
+
+
+# ---------------------------------------------------------------------------
+# Presentation helpers (ported from v1)
+
+_MOVE_TOKEN_RE = re.compile(r"\b(BLK|BLU|G|Y|P|R)[0-9]?\b")
+_MOVE_WORDS = [
+    (re.compile(r"\bBLACK\b"), "⚫"), (re.compile(r"\bBLUE\b"), "🔵"),
+    (re.compile(r"\bGREEN\b|\bGRN\b"), "🟢"),
+    (re.compile(r"\bYELLOW\b|\bYLW\b"), "🟡"),
+    (re.compile(r"\bPURPLE\b|\bPUR\b"), "🟣"),
+    (re.compile(r"\bRED\b"), "🔴"),
+]
+_MOVE_TOKENS = {"BLK": "⚫", "BLU": "🔵", "G": "🟢", "Y": "🟡", "P": "🟣", "R": "🔴"}
+
+
+def move_emoji(move_text: str) -> str:
+    t = move_text.upper()
+    m = _MOVE_TOKEN_RE.search(t)
+    if m:
+        return _MOVE_TOKENS[m.group(1)]
+    for pattern, emoji in _MOVE_WORDS:
+        if pattern.search(t):
+            return emoji
+    return "⚡"
+
+
+def class_color(klass: str) -> int:
+    return CLASS_COLORS.get(klass, DEFAULT_COLOR)
+
+
+def clip(text: str, limit: int = MAX_FIELD) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def bullet_field(lines, limit: int = MAX_FIELD) -> str:
+    """Join bullet lines, truncating with a '…and N more' tail if needed."""
+    out, used = [], 0
+    for i, line in enumerate(lines):
+        extra = len(line) + 1
+        if used + extra > limit:
+            out.append(f"…and {len(lines) - i} more")
+            break
+        out.append(line)
+        used += extra
+    return "\n".join(out) if out else "—"
+
+
+def build_embed(build: dict, page: int = 0) -> discord.Embed:
+    movesets = build["movesets"] or [[]]
+    page = max(0, min(page, len(movesets) - 1))
+    embed = discord.Embed(
+        title=build["name"],
+        description=(f"{build['era_style']} • {build['gender']} "
+                     f"{build['class']} • Tier {build['tier']}"),
+        color=class_color(build["class"]),
+    )
+    moves = movesets[page]
+    move_lines = "\n".join(f"+ {move_emoji(m)} {m}" for m in moves) or "—"
+    tier_text = ""
+    if page < len(build.get("moveset_tiers", [])):
+        tier_text = build["moveset_tiers"][page].strip()
+    value = f"```diff\n{move_lines}\n```"
+    if tier_text:
+        value += clip(tier_text, 300)
+    embed.add_field(name=f"⚡ Moveset {page + 1} of {len(movesets)}",
+                    value=clip(value), inline=False)
+
+    sections = [
+        ("💪 Trainers", build["trainers"]),
+        ("👑 Coaches", build["coaches"]),
+        ("⭐ Skill Plates", build["skill_plates"]),
+        ("✨ Ultimate Plates", build["ultimate_plates"]),
+        ("🎒 Gear & Moments", build["gear"]),
+        ("🤝 Tag Links", build["tag_links"]),
+        ("🛡️ Reversals to Avoid", build["reversals"]),
+    ]
+    for title, items in sections:
+        if items:
+            body = "\n".join(f"• {item}" for item in items)
+            embed.add_field(name=title, value=clip(body), inline=False)
+    if build.get("entourage"):
+        embed.add_field(name="👥 Entourage Ability",
+                        value=clip(build["entourage"]), inline=False)
+    if build.get("notes"):
+        embed.add_field(name="📝 Notes", value=clip(build["notes"]), inline=False)
+    if build.get("videos"):
+        links = "\n".join(f"🔗 [Watch Video]({v})" for v in build["videos"])
+        embed.add_field(name="🎬 Gameplay Videos", value=clip(links), inline=False)
+    return embed
+
+
+def card_embed(card: dict) -> discord.Embed:
+    role_label = card["role"]
+    if role_label == "Promoter":
+        role_label = "Promoter (coach slot)"
+    cost = f" • {card['cost_k']}K" if card.get("cost_k") else ""
+    embed = discord.Embed(
+        title=card["name"],
+        description=(f"{card['era_style']} • {card['gender']} "
+                     f"{card['class']}"),
+        color=class_color(card["class"]),
+    )
+    embed.add_field(name=f"🎴 {role_label}{cost}",
+                    value=clip(card["effect"] or "—"), inline=False)
+    return embed
+
+
+# ---------------------------------------------------------------------------
+# Pagination view for multi-moveset builds
+
+class BuildPager(discord.ui.View):
+    def __init__(self, build: dict, user_id: int):
+        super().__init__(timeout=180)
+        self.build = build
+        self.user_id = user_id
+        self.page = 0
+        self.pages = max(1, len(build["movesets"]))
+        self._sync_buttons()
+
+    def _sync_buttons(self):
+        self.prev_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= self.pages - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.user_id
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction,
+                          button: discord.ui.Button):
+        self.page -= 1
+        self._sync_buttons()
+        await interaction.response.edit_message(
+            embed=build_embed(self.build, self.page), view=self)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction,
+                          button: discord.ui.Button):
+        self.page += 1
+        self._sync_buttons()
+        await interaction.response.edit_message(
+            embed=build_embed(self.build, self.page), view=self)
+
+
+class BuildPicker(discord.ui.View):
+    """Select menu shown when a /build query matches several personas."""
+
+    def __init__(self, builds: list, user_id: int):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        options = [
+            discord.SelectOption(
+                label=b["name"][:100],
+                description=f"{b['gender']} {b['class']} • Tier {b['tier']}"[:100],
+                value=str(i))
+            for i, b in enumerate(builds[:25])
+        ]
+        self.builds = builds
+        select = discord.ui.Select(placeholder="Pick a superstar…",
+                                   options=options)
+        select.callback = self._picked
+        self.add_item(select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.user_id
+
+    async def _picked(self, interaction: discord.Interaction):
+        build = self.builds[int(interaction.data["values"][0])]
+        if len(build["movesets"]) > 1:
+            view = BuildPager(build, interaction.user.id)
+            await interaction.response.edit_message(
+                content=None, embed=build_embed(build, 0), view=view)
+        else:
+            await interaction.response.edit_message(
+                content=None, embed=build_embed(build, 0), view=None)
+
+
+# ---------------------------------------------------------------------------
+# Autocomplete callbacks (module-level so tests can call them directly)
+
+async def superstar_autocomplete(interaction: discord.Interaction,
+                                 current: str):
     try:
-        df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
-        all_sheets[sheet_name] = df
-        if len(df) > 0:
-            sheet_headers[sheet_name] = df.iloc[0].tolist()
-        print(f"✅ Loaded sheet: {sheet_name} ({df.shape[0]} rows, {df.shape[1]} columns)")
-    except Exception as e:
-        print(f"⚠️ Could not read sheet '{sheet_name}': {e}")
+        index = get_index()
+    except Exception:
+        return []
+    if current.strip():
+        results = search_core.search_builds(index, current, limit=25)
+    else:
+        results = index["builds"][:25]
+    return [app_commands.Choice(name=b["name"], value=b["name"])
+            for b in results]
 
-if not all_sheets:
-    print("❌ No sheets could be read.")
-    exit()
 
-bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=INTENTS)
+async def plate_autocomplete(interaction: discord.Interaction, current: str):
+    try:
+        index = get_index()
+    except Exception:
+        return []
+    results = search_core.search_plates(index, current, limit=25)
+    return [app_commands.Choice(name=p["name"][:100], value=p["name"])
+            for p in results]
+
+
+def _card_autocomplete(roles):
+    async def callback(interaction: discord.Interaction, current: str):
+        try:
+            index = get_index()
+        except Exception:
+            return []
+        if current.strip():
+            results = search_core.search_cards(index, current, roles=roles,
+                                               limit=25)
+        else:
+            pool = [c for c in index["cards"] if c["role"] in roles]
+            results = pool[:25]
+        return [app_commands.Choice(name=c["name"][:100], value=c["name"])
+                for c in results]
+    return callback
+
+
+trainer_autocomplete = _card_autocomplete(("Trainer",))
+coach_autocomplete = _card_autocomplete(("Coach", "Promoter"))
+
+
+# ---------------------------------------------------------------------------
+# Bot + commands
+
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
 
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
 
-def get_wrestler_name_column(df):
-    """Try to identify the wrestler name column (usually column A or B after Era)."""
-    if len(df) > 0:
-        headers = df.iloc[0].astype(str)
-        for idx, header in enumerate(headers):
-            if header.lower() in ['era', 'wrestler', 'name']:
-                if header.lower() == 'era' and idx + 1 < len(headers):
-                    return idx + 1
-                return idx
-    return 0
 
-def expand_merged_rows(df, match_indices, name_col_idx):
-    """Expand matched rows to include subsequent rows with blank names (merged cells)."""
-    expanded_indices = set()
-    
-    for idx in match_indices:
-        expanded_indices.add(idx)
-        
-        next_idx = idx + 1
-        while next_idx < len(df):
-            next_val = str(df.iloc[next_idx, name_col_idx]).strip()
-            if next_val == '' or next_val.lower() == 'nan':
-                expanded_indices.add(next_idx)
-                next_idx += 1
-            else:
-                break
-    
-    return sorted(expanded_indices)
-
-def format_moveset_group(df, indices, headers):
-    """Format a group of 3 rows as one moveset in a beautiful modern format."""
-    if not indices or len(indices) == 0:
-        return []
-    
-    first_row = df.iloc[indices[0]]
-    wrestler_info = []
-    for j in range(min(3, len(first_row))):
-        val_str = str(first_row.iloc[j]).strip()
-        if val_str and val_str.lower() != 'nan':
-            wrestler_info.append(val_str)
-    
-    wrestler_header = " | ".join(wrestler_info) if wrestler_info else ""
-    
-    movesets = []
-    moveset_number = 1
-    for i in range(0, len(indices), 3):
-        moveset_indices = indices[i:i+3]
-        if len(moveset_indices) == 0:
-            continue
-        
-        moves = []
-        for idx in moveset_indices:
-            row = df.iloc[idx]
-            if len(row) > 3:
-                move = str(row.iloc[3]).strip()
-                if move and move.lower() != 'nan':
-                    moves.append(move)
-        
-        other_info = {}
-        for idx in moveset_indices:
-            row = df.iloc[idx]
-            for j in range(4, len(row)):
-                header_idx = j if j < len(headers) else -1
-                if header_idx >= 0:
-                    header = str(headers[header_idx]).strip()
-                    val = str(row.iloc[j]).strip()
-                    
-                    if val and val.lower() != 'nan' and header and header.lower() != 'nan':
-                        if header not in other_info:
-                            other_info[header] = []
-                        if val not in other_info[header]:
-                            other_info[header].append(val)
-        
-        # Build the formatted text with modern styling
-        formatted_parts = []
-        
-        # Header with emoji
-        formatted_parts.append(f"🎯 **MOVESET #{moveset_number}**")
-        # Determine Coming Soon tag by scanning early cells across the grouped rows
-        is_coming_soon = False
-        for idx_scan in indices:
-            row_scan = df.iloc[idx_scan]
-            for j in range(min(5, len(row_scan))):
-                val = str(row_scan.iloc[j]).strip()
-                if val and val.lower().startswith("coming soon"):
-                    is_coming_soon = True
-                    break
-            if is_coming_soon:
-                break
-        display_header = wrestler_header
-        if is_coming_soon:
-            display_header = f"{wrestler_header} — Coming Soon" if wrestler_header else "Coming Soon"
-        # Append Tier Feud Poster suffix
-        if display_header:
-            display_header = f"{display_header} Tier Feud Poster"
-        formatted_parts.append(f"**{display_header}**\n")
-        
-        # Moves section
-        if moves:
-            formatted_parts.append("⚡ **MOVES**")
-            formatted_parts.append("```diff")
-            import re
-            def get_move_color_emoji(move_text: str) -> str:
-                t = move_text.upper()
-                # Prefer explicit tokens with optional number suffix (e.g., BLK, BLU3, R1)
-                m = re.search(r"\b(BLK|BLU|G|Y|P|R)[0-9]?\b", t)
-                token = m.group(1) if m else None
-                if token == "BLK":
-                    return "⚫"
-                if token == "BLU":
-                    return "🔵"
-                if token == "G":
-                    return "🟢"
-                if token == "Y":
-                    return "🟡"
-                if token == "P":
-                    return "🟣"
-                if token == "R":
-                    return "🔴"
-                # Fallback to full color words or common alt-abbreviations
-                if re.search(r"\bBLACK\b", t):
-                    return "⚫"
-                if re.search(r"\bBLUE\b", t):
-                    return "🔵"
-                if re.search(r"\bGREEN\b|\bGRN\b", t):
-                    return "🟢"
-                if re.search(r"\bYELLOW\b|\bYLW\b", t):
-                    return "🟡"
-                if re.search(r"\bPURPLE\b|\bPUR\b", t):
-                    return "🟣"
-                if re.search(r"\bRED\b", t):
-                    return "🔴"
-                return "⚡"
-            for idx, move in enumerate(moves, 1):
-                move_emoji = get_move_color_emoji(move)
-                formatted_parts.append(f"+ {move_emoji} {move}")
-            formatted_parts.append("```\n")
-        
-        # Trainers section
-        trainers = []
-        if "Trainer 1" in other_info:
-            trainers.extend(other_info["Trainer 1"])
-        if "Trainer 2" in other_info:
-            trainers.extend(other_info["Trainer 2"])
-        
-        if trainers:
-            formatted_parts.append("💪 **TRAINERS**")
-            formatted_parts.append("```yaml")
-            for t in trainers:
-                formatted_parts.append(f"• {t}")
-            formatted_parts.append("```\n")
-        
-        # Coaches section
-        coaches = []
-        if "Coach 1" in other_info:
-            coaches.extend(other_info["Coach 1"])
-        if "Coach 2" in other_info:
-            coaches.extend(other_info["Coach 2"])
-        
-        if coaches:
-            formatted_parts.append("👑 **COACHES**")
-            formatted_parts.append("```yaml")
-            for c in coaches:
-                formatted_parts.append(f"• {c}")
-            formatted_parts.append("```\n")
-        
-        # Skill Plates
-        if "Skill Plates" in other_info:
-            formatted_parts.append("⭐ **SKILL PLATES**")
-            formatted_parts.append("```yaml")
-            for p in other_info["Skill Plates"]:
-                formatted_parts.append(f"• {p}")
-            formatted_parts.append("```\n")
-        
-        # Ultimate Plates
-        if "Ultimate Plates" in other_info:
-            formatted_parts.append("✨ **ULTIMATE PLATES**")
-            formatted_parts.append("```yaml")
-            for p in other_info["Ultimate Plates"]:
-                formatted_parts.append(f"• {p}")
-            formatted_parts.append("```\n")
-        
-        # Gear & Moments
-        if "Gear & Moments" in other_info:
-            formatted_parts.append("🎒 **GEAR & MOMENTS**")
-            formatted_parts.append("```yaml")
-            for g in other_info["Gear & Moments"]:
-                formatted_parts.append(f"• {g}")
-            formatted_parts.append("```\n")
-        
-        # Tag Links
-        if "Tag Links" in other_info:
-            formatted_parts.append("🤝 **TAG LINKS**")
-            formatted_parts.append("```yaml")
-            for t in other_info["Tag Links"]:
-                formatted_parts.append(f"• {t}")
-            formatted_parts.append("```\n")
-        
-        # Entourage Ability
-        if "Entourage Ability" in other_info:
-            formatted_parts.append("👥 **ENTOURAGE**")
-            formatted_parts.append("```yaml")
-            for e in other_info["Entourage Ability"]:
-                formatted_parts.append(f"• {e}")
-            formatted_parts.append("```\n")
-        
-        # Notes
-        if "Notes" in other_info:
-            formatted_parts.append("📝 **NOTES**")
-            formatted_parts.append("```")
-            for n in other_info["Notes"]:
-                formatted_parts.append(f"• {n}")
-            formatted_parts.append("```\n")
-        
-        # Gameplay Videos
-        if "Gameplay Videos" in other_info:
-            formatted_parts.append("🎬 **GAMEPLAY VIDEOS**")
-            for v in other_info["Gameplay Videos"]:
-                # Make sure the URL is clickable - format as Discord hyperlink
-                v_stripped = v.strip()
-                if v_stripped.startswith(("http://", "https://")):
-                    # Full URL - make it clickable
-                    formatted_parts.append(f"🔗 [Watch Video]({v_stripped})")
-                elif v_stripped.startswith("www."):
-                    # URL without protocol - add https
-                    url = f"https://{v_stripped}"
-                    formatted_parts.append(f"🔗 [Watch Video]({url})")
-                elif "youtube.com" in v_stripped.lower() or "youtu.be" in v_stripped.lower():
-                    # YouTube link without protocol
-                    url = v_stripped if v_stripped.startswith("http") else f"https://{v_stripped}"
-                    formatted_parts.append(f"🔗 [Watch Video]({url})")
-                else:
-                    # Not a recognizable URL format - display as-is
-                    formatted_parts.append(f"🔗 {v_stripped}")
-            formatted_parts.append("")  # Empty line for spacing
-        
-        movesets.append("\n".join(formatted_parts))
-        moveset_number += 1
-    
-    return movesets
-
-@bot.command(name="lookup")
-async def lookup(ctx, *, name: str):
-    """Search all Excel sheets for a wrestler name (excluding Trainer/Coach columns and Tier List sheet)."""
-    name = name.strip()
-    print(f"🔍 Searching for: {name}")
-
-    results_by_sheet = {}
-    tier_list_entries = []
-    all_superstar_data = {}  # Store data per superstar for selection
-
-    for sheet_name, df in all_sheets.items():
-        # Special handling for 'Tier List': only consider row 7 (index 6) and place in separate embed
-        if sheet_name.lower() == "tier list":
-            if len(df) > 6:
-                row = df.iloc[6]
-                # If any cell in row 7 contains the search term, surface it
-                row_strs = [str(cell) for cell in row.tolist()]
-                if any(name.lower() in s.lower() for s in row_strs):
-                    # Collect ONLY superstar names from the row
-                    names = []
-                    seen = set()
-                    for j in range(len(row)):
-                        raw_val = row.iloc[j]
-                        val = str(raw_val).strip()
-                        if not val or val.lower() == 'nan':
-                            continue
-                        lower_val = val.lower()
-                        # Skip intro/marketing or markers
-                        if lower_val.startswith("coming soon"):
-                            continue
-                        if lower_val.startswith("brought to you by"):
-                            continue
-                        # Split on commas to handle multiple names in one cell
-                        parts = [p.strip() for p in val.split(',')]
-                        for p in parts:
-                            if not p:
-                                continue
-                            key = p.lower()
-                            if key not in seen:
-                                seen.add(key)
-                                names.append(p)
-                    if names:
-                        pretty_block = "\n".join(f"• {n}" for n in names)
-                        tier_list_entries.append(f"**Coming Soon (Tier List Row 7)**\n{pretty_block}")
-            continue
-        
-        df_original = df.copy()
-        original_headers = sheet_headers.get(sheet_name, [])
-        
-        name_col_idx = get_wrestler_name_column(df_original)
-        
-        excluded_cols = []
-        if len(df_original) > 0:
-            df_headers = df_original.iloc[0].astype(str)
-            
-            for idx, header in enumerate(df_headers):
-                if any(excluded_name.lower() in header.lower() for excluded_name in EXCLUDED_COLUMN_NAMES):
-                    excluded_cols.append(idx)
-            
-            cols_to_search = [i for i in range(len(df_original.columns)) if i not in excluded_cols]
-            df_to_search = df_original.iloc[:, cols_to_search]
-            
-            df_to_display = df_original
-            display_headers = original_headers
-            
-            if name_col_idx is not None:
-                removed_before = sum(1 for col in excluded_cols if col < name_col_idx)
-                search_name_col_idx = name_col_idx - removed_before
-            else:
-                search_name_col_idx = None
-        else:
-            df_to_search = df_original
-            df_to_display = df_original
-            display_headers = original_headers
-            search_name_col_idx = None
-        
-        mask = df_to_search.astype(str).apply(lambda x: x.str.contains(name, case=False, na=False))
-        match_indices = df_to_search[mask.any(axis=1)].index.tolist()
-        
-        if match_indices and search_name_col_idx is not None:
-            match_indices = expand_merged_rows(df_to_search, match_indices, search_name_col_idx)
-        
-        if match_indices:
-            # Extract full superstar names from raw data (including variant/class) for grouping
-            for i in range(0, len(match_indices), 3):
-                moveset_group = match_indices[i:i+3]
-                if moveset_group:
-                    first_row = df_original.iloc[moveset_group[0]]
-                    # Build full name from first 3 columns (Wrestler | Era | Class)
-                    full_name_parts = []
-                    for j in range(min(3, len(first_row))):
-                        val = str(first_row.iloc[j]).strip()
-                        if val and val.lower() != 'nan':
-                            full_name_parts.append(val)
-                    full_superstar_name = " | ".join(full_name_parts) if full_name_parts else "Unknown"
-                    
-                    # Use full name as key for better identification
-                    if full_superstar_name not in all_superstar_data:
-                        all_superstar_data[full_superstar_name] = {}
-                    if sheet_name not in all_superstar_data[full_superstar_name]:
-                        all_superstar_data[full_superstar_name][sheet_name] = []
-            
-            movesets = format_moveset_group(df_to_display, match_indices, display_headers)
-            if movesets:
-                # Group movesets by full superstar name
-                for moveset_idx, moveset in enumerate(movesets):
-                    # Find which superstar this moveset belongs to
-                    moveset_group_start = moveset_idx * 3
-                    if moveset_group_start < len(match_indices):
-                        moveset_group = match_indices[moveset_group_start:min(moveset_group_start + 3, len(match_indices))]
-                        if moveset_group:
-                            first_row = df_original.iloc[moveset_group[0]]
-                            full_name_parts = []
-                            for j in range(min(3, len(first_row))):
-                                val = str(first_row.iloc[j]).strip()
-                                if val and val.lower() != 'nan':
-                                    full_name_parts.append(val)
-                            full_superstar_name = " | ".join(full_name_parts) if full_name_parts else "Unknown"
-                            
-                            if full_superstar_name in all_superstar_data and sheet_name in all_superstar_data[full_superstar_name]:
-                                all_superstar_data[full_superstar_name][sheet_name].append(moveset)
-                results_by_sheet[sheet_name] = movesets
-
-    if not results_by_sheet and not tier_list_entries:
-        await ctx.send(
-            f"❌ No results found for **{name}**.\n"
-            f"- Double-check the spelling.\n"
-            f"- Or this superstar may not have a viable feud build at 6★ Gold."
-        )
-        return
-
-    # Check if multiple distinct superstars found - show selection menu
-    if len(all_superstar_data) > 1:
-        number_emojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟']
-        superstar_list = list(all_superstar_data.keys())[:10]  # Max 10 options
-        
-        selection_text = "**Multiple superstars found!** Please react with the number to view:\n\n"
-        for idx, superstar in enumerate(superstar_list):
-            selection_text += f"{number_emojis[idx]} {superstar}\n"
-        
-        selection_msg = await ctx.send(selection_text)
-        
-        # Add reactions
-        for idx in range(len(superstar_list)):
-            await selection_msg.add_reaction(number_emojis[idx])
-        
-        # Wait for reaction from the command author
-        def check(reaction, user):
-            return user == ctx.author and str(reaction.emoji) in number_emojis[:len(superstar_list)] and reaction.message.id == selection_msg.id
-        
-        try:
-            reaction, user = await bot.wait_for('reaction_add', timeout=60.0, check=check)
-            selected_idx = number_emojis.index(str(reaction.emoji))
-            selected_superstar = superstar_list[selected_idx]
-            
-            # Filter results to only show selected superstar
-            results_by_sheet = all_superstar_data[selected_superstar].copy()
-            await selection_msg.delete()  # Remove selection message
-            
-        except asyncio.TimeoutError:
-            await ctx.send("⏱️ Selection timed out. Please run the command again.")
+@bot.tree.command(name="build", description="Look up a superstar's feud build")
+@app_commands.describe(superstar="Superstar / persona name")
+@app_commands.autocomplete(superstar=superstar_autocomplete)
+async def build_cmd(interaction: discord.Interaction, superstar: str):
+    index = get_index()
+    build = search_core.exact_build(index, superstar)
+    if build is None:
+        matches = search_core.search_builds(index, superstar, limit=25)
+        if len(matches) == 1:
+            build = matches[0]
+        elif matches:
+            await interaction.response.send_message(
+                f"**{len(matches)} builds match** — pick one:",
+                view=BuildPicker(matches, interaction.user.id))
             return
-    
-    def split_long_text(text, max_length=1020):
-        """Split text into chunks that fit within Discord field limits, trying to preserve line breaks."""
-        if len(text) <= max_length:
-            return [text]
-        
-        chunks = []
-        lines = text.split('\n')
-        current_chunk = []
-        current_length = 0
-        
-        for line in lines:
-            line_with_newline = line + '\n' if line != lines[-1] else line
-            line_length = len(line_with_newline)
-            
-            if current_length + line_length > max_length and current_chunk:
-                # Save current chunk and start new one
-                chunks.append('\n'.join(current_chunk))
-                current_chunk = [line]
-                current_length = len(line)
-            else:
-                current_chunk.append(line)
-                current_length += line_length
-        
-        if current_chunk:
-            chunks.append('\n'.join(current_chunk))
-        
-        return chunks
-    
+    if build is not None:
+        if len(build["movesets"]) > 1:
+            view = BuildPager(build, interaction.user.id)
+            await interaction.response.send_message(
+                embed=build_embed(build, 0), view=view)
+        else:
+            await interaction.response.send_message(embed=build_embed(build, 0))
+        return
+    card = search_core.exact_card(index, superstar) or (
+        search_core.search_cards(index, superstar, limit=1) or [None])[0]
+    if card is not None:
+        cmd = "/trainer" if card["role"] == "Trainer" else "/coach"
+        await interaction.response.send_message(
+            f"**{card['name']}** has no feud build in the sheet — it's a "
+            f"{card['role']} entourage card. Try `{cmd} {card['name']}`.")
+        return
+    await interaction.response.send_message(
+        f"❌ No build found for **{superstar}**. Check the spelling, or the "
+        f"superstar may not have a feud build in the tier list.")
+
+
+@bot.tree.command(name="plate", description="Find which builds use a plate")
+@app_commands.describe(name="Skill or Ultimate Plate name")
+@app_commands.autocomplete(name=plate_autocomplete)
+async def plate_cmd(interaction: discord.Interaction, name: str):
+    index = get_index()
+    plate = search_core.get_plate(index, name)
+    if plate is None:
+        hits = search_core.search_plates(index, name, limit=1)
+        plate = hits[0] if hits else None
+    if plate is None:
+        await interaction.response.send_message(
+            f"❌ No plate named **{name}** in the index.")
+        return
+    embed = discord.Embed(title=f"🛡️ {plate['name']}",
+                          color=DEFAULT_COLOR)
+    for kind, title in (("skill", "⭐ As Skill Plate"),
+                        ("ultimate", "✨ As Ultimate Plate")):
+        users = plate[kind]
+        if not users:
+            continue
+        lines = [f"• {u['name']} ({u['gender']} {u['class']}, Tier {u['tier']})"
+                 for u in users]
+        embed.add_field(name=f"{title} — {len(users)} build(s)",
+                        value=bullet_field(lines), inline=False)
+    if not plate["skill"] and not plate["ultimate"]:
+        embed.description = "No builds in the sheet use this plate."
+    await interaction.response.send_message(embed=embed)
+
+
+async def _card_cmd(interaction: discord.Interaction, name: str, roles,
+                    label: str):
+    index = get_index()
+    card = search_core.exact_card(index, name, roles=roles)
+    if card is None:
+        hits = search_core.search_cards(index, name, roles=roles, limit=1)
+        card = hits[0] if hits else None
+    if card is None:
+        await interaction.response.send_message(
+            f"❌ No {label} card named **{name}** in the index.")
+        return
+    await interaction.response.send_message(embed=card_embed(card))
+
+
+@bot.tree.command(name="trainer", description="Look up a Trainer entourage card")
+@app_commands.describe(name="Trainer card name (superstar persona)")
+@app_commands.autocomplete(name=trainer_autocomplete)
+async def trainer_cmd(interaction: discord.Interaction, name: str):
+    await _card_cmd(interaction, name, ("Trainer",), "Trainer")
+
+
+@bot.tree.command(name="coach", description="Look up a Coach entourage card (incl. Promoters)")
+@app_commands.describe(name="Coach card name (superstar persona)")
+@app_commands.autocomplete(name=coach_autocomplete)
+async def coach_cmd(interaction: discord.Interaction, name: str):
+    await _card_cmd(interaction, name, ("Coach", "Promoter"), "Coach")
+
+
+@bot.tree.command(name="tierlist", description="Show the tier list rankings and Coming Soon")
+async def tierlist_cmd(interaction: discord.Interaction):
+    index = get_index()
+    tier_list = index["tier_list"]
+    rankings = tier_list["rankings"]
+    order = [t for t in TIER_ORDER if t in rankings]
+    order += [t for t in rankings if t not in TIER_ORDER]
+
     embeds = []
-    # Add a separate embed for Tier List coming soon entries if present
-    if tier_list_entries:
-        # Join entries but keep each as its own section
-        tier_description = "\n\n".join(tier_list_entries)
-        # If very long, split into chunks across multiple embeds
-        max_desc_len = 3500
-        tier_chunks = []
-        if len(tier_description) <= max_desc_len:
-            tier_chunks = [tier_description]
+    for tier in order:
+        entries = rankings[tier]
+        embed = discord.Embed(title=f"🏆 {tier}", color=0xF1C40F)
+        if tier == "Entourage":
+            # 500+ card personas - a name dump helps nobody; point at the
+            # card commands instead (documented in README).
+            embed.description = (
+                f"{len(entries)} entourage personas are ranked here. "
+                f"Use `/trainer` or `/coach` to look one up.")
         else:
-            # Split on double newlines between entries to avoid breaking code blocks
-            sections = tier_description.split("\n\n")
-            current = []
-            current_len = 0
-            for sec in sections:
-                add_len = len(sec) + 2
-                if current_len + add_len > max_desc_len and current:
-                    tier_chunks.append("\n\n".join(current))
-                    current = [sec]
-                    current_len = len(sec)
-                else:
-                    current.append(sec)
-                    current_len += add_len
-            if current:
-                tier_chunks.append("\n\n".join(current))
-        
-        for idx_chunk, chunk in enumerate(tier_chunks):
-            tier_embed = discord.Embed(
-                title="🕒 Coming Soon (Tier List)" + (f" — Part {idx_chunk+1}" if len(tier_chunks) > 1 else ""),
-                description=chunk,
-                color=0xF1C40F
-            )
-            tier_embed.set_footer(text="Tier List — Row 7 only")
-            embeds.append(tier_embed)
+            names = [e["name"] for e in entries]
+            chunks = [names[i:i + 40] for i in range(0, len(names), 40)]
+            for n, chunk in enumerate(chunks):
+                embed.add_field(
+                    name="Rankings" if n == 0 else "Rankings (cont.)",
+                    value=clip(", ".join(chunk)), inline=False)
+        embeds.append(embed)
 
-    # Color mapping for different sheets to make embeds more colorful
-    def get_embed_color(sheet_name: str) -> int:
-        s = sheet_name.lower()
-        if "strikers" in s:
-            return 0x000000  # black
-        if "acros" in s or "acro" in s:
-            return 0x3498DB  # blue
-        if "tech" in s:
-            return 0x2ECC71  # green
-        if "trick" in s:
-            return 0x9B59B6  # purple
-        if "phs" in s or "powerhouse" in s:
-            return 0xE74C3C  # red
-        if "sbs" in s or "showboat" in s:
-            return 0xF1C40F  # yellow
-        if "tier list" in s:
-            return 0xF1C40F  # gold
-        return 0x5865F2  # default blurple
+    soon = tier_list.get("coming_soon") or []
+    if soon:
+        embeds.append(discord.Embed(
+            title="🕒 Coming Soon", color=0xF1C40F,
+            description=clip(", ".join(soon))))
 
-    current_embed = discord.Embed(
-        title=f"🔍 Search Results: {name.title()}",
-        description="📋 **All matching entries across sheets:**\n⚠️ Note: Results only include superstars with feud builds at 6★ Gold.",
-        color=0x5865F2  # default; will be adjusted per sheet when possible
-    )
-    current_size = len(current_embed.title or "") + len(current_embed.description or "")
-    
-    for sheet_name, entries in results_by_sheet.items():
-        for i, entry in enumerate(entries[:10]):
-            # Ensure the current embed color matches this sheet when starting a new embed with no fields
-            if len(current_embed.fields) == 0 and (current_embed.description is not None):
-                # Recreate embed with appropriate color for this sheet
-                current_embed = discord.Embed(
-                    title=current_embed.title,
-                    description=current_embed.description,
-                    color=get_embed_color(sheet_name)
-                )
-                current_size = len(current_embed.title or "") + len(current_embed.description or "")
-            # Split long entries into multiple chunks
-            entry_chunks = split_long_text(entry)
-            
-            for chunk_idx, entry_chunk in enumerate(entry_chunks):
-                if i == 0 and chunk_idx == 0:
-                    field_name = f"📄 {sheet_name}"
-                elif chunk_idx == 0:
-                    field_name = f"📄 {sheet_name} — Continued"
-                else:
-                    field_name = f"📄 {sheet_name} — Part {chunk_idx + 1}"
-                
-                field_size = len(field_name) + len(entry_chunk)
-                if current_size + field_size > 5500:
-                    embeds.append(current_embed)
-                    current_embed = discord.Embed(
-                        title=f"🔍 Search Results: {name.title()} (Continued)",
-                        description="📋 **All matching entries across sheets:**\n⚠️ Note: Results only include superstars with feud builds at 6★ Gold.",
-                        color=get_embed_color(sheet_name)
-                    )
-                    current_size = len(current_embed.title or "") + len(current_embed.description or "")
-                
-                current_embed.add_field(name=field_name, value=entry_chunk, inline=False)
-                current_size += field_size
-    
-    if len(current_embed.fields) > 0:
-        embeds.append(current_embed)
-    
-    for idx, embed in enumerate(embeds):
-        if idx < len(embeds) - 1:
-            embed.set_footer(text=f"📄 Page {idx + 1} of {len(embeds)} • More results below...")
-        else:
-            embed.set_footer(text=f"📄 Page {idx + 1} of {len(embeds)} • End of results")
-        embed.timestamp = discord.utils.utcnow()
-        await ctx.send(embed=embed)
+    # Discord allows up to 10 embeds per message.
+    first, rest = embeds[:10], embeds[10:]
+    await interaction.response.send_message(embeds=first)
+    for i in range(0, len(rest), 10):
+        await interaction.followup.send(embeds=rest[i:i + 10])
 
-if __name__ == "__main__":
-    token = os.environ.get('DISCORD_BOT_TOKEN')
+
+@bot.tree.command(name="refresh", description="(Admin) Re-download the tier list sheet and rebuild the index")
+@app_commands.default_permissions(administrator=True)
+async def refresh_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    old_stats = get_index()["stats"]
+
+    def _rebuild():
+        tmpdir = Path(tempfile.mkdtemp(prefix="champions-refresh-"))
+        xlsx = build_index.download_sheet(tmpdir / "sheet.xlsx")
+        data = build_index.parse_workbook(xlsx)
+        tmp_json = BASE_DIR / "data" / "index.json.tmp"
+        tmp_json.write_text(json.dumps(data, indent=1, ensure_ascii=False),
+                            encoding="utf-8")
+        tmp_json.replace(INDEX_PATH)  # swap only after a clean parse
+        return data
+
+    try:
+        data = await asyncio.to_thread(_rebuild)
+    except Exception as exc:  # download/parse failed: old index stays live
+        await interaction.followup.send(
+            f"❌ Refresh failed ({exc.__class__.__name__}: {exc}). "
+            f"The previous index is still in use.")
+        return
+    set_index(data)
+    new_stats = data["stats"]
+    await interaction.followup.send(
+        f"✅ Index rebuilt from the live sheet.\n"
+        f"Builds: {old_stats['builds']} → {new_stats['builds']} • "
+        f"Cards: {old_stats['cards']} → {new_stats['cards']} • "
+        f"Plates: {old_stats['plates']} → {new_stats['plates']}")
+
+
+async def _setup_hook():
+    guild_id = os.environ.get("DISCORD_GUILD_ID")
+    if guild_id:
+        guild = discord.Object(id=int(guild_id))
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+        print(f"🔧 Commands synced to guild {guild_id}")
+    else:
+        await bot.tree.sync()
+        print("🔧 Commands synced globally")
+
+
+bot.setup_hook = _setup_hook
+
+
+def main() -> int:
+    token = os.environ.get("DISCORD_BOT_TOKEN")
     if not token:
         print("❌ Error: DISCORD_BOT_TOKEN environment variable not found")
-        print("💡 Please set your Discord bot token as an environment variable")
-        exit(1)
-    
-    # Run the Discord bot
+        print("💡 Set your Discord bot token as an environment variable")
+        return 1
     bot.run(token)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
